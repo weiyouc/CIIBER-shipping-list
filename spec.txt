@@ -1,0 +1,35 @@
+Goal:
+    In this project, we need to take a shipping list excel file and produce two invoice files - one for export, one for re-import
+
+Input files:
+    1. The shipping list file is in excel format
+        The table header looks like this:
+        "Sr NO (序列号)"	"P/N.（系统料号 ）"	"供应商" "项目名称"	"工厂(Daman/Silvassa)"	"清关英文货描（关务提供）"	"报关中文品名"	"DESCRIPTION (系统英文品名）"	"开票名称"	"物料名称"	"MODEL（货物型号（与实物相符)"	"QUANTITY （数量）"	单位	"Carton MEASUREMENT (外箱尺寸CM）"	体积（CBM）	总体积	单件毛重	"G.W（KG) 总毛重"	"单件净重"	"N.W  (KG) 总净重"	整箱数量	件数	"CTN NO. (箱号)"	"出口报关方式"	"采购单位（智乐/UC/客供/供应商赠送/系统外订单）"	"不含税单价（RMB）"	"开票税率"
+																										
+    2. A policy file in excel format that dictates the markup margin for the items
+    3. A shipping rate file in the excel format that indicate the current shipping rate
+    4. A exchange rate file that captures the exchange rate between RMB USD Rupee
+
+Output files:
+    1. An excel file that contains the export receipt
+    2. An excel file that contains the re-import receipt
+
+Step 1: Normalize the shipping list file:
+    Once we have the shipping list file, we first need to do a de-dupe operation to merge the items if the P/N value is the same AND the unit prices are the same.
+    We will save this interim result to a separate excel file - called de-duped excel.
+
+Step 2: Generate the export receipt file with the right unit CIF price including shipping
+    1. Get the markup % and insurance rate from the policy excel file
+    2. Get the exchange rate
+    3. Get the shipping rate (which is RMB/KG)
+    4. Calculate the FOB prices
+        4.a FOB unit price = Unit price * (1 + markup %)
+        4.b FOB total price = FOB unit price * quantity
+    5. The CIF unit price is calculated based on the following
+        5.a Calculate the adjusted total goods cost with insurance: (total FOB price * insurance co-efficiency * (1+insurance rate))
+        5.b Calculate the total shipping cost: net weight * shipping rate
+        5.c Calculate the CIF total cost: total goods cost with insurance + total shipping cost
+        5.d Calculate the CIF unit price in RMB:  total CIF cost / quantity
+        5.e Calculate the final CIF unit price in USD: CIF unit price in RMB / RMB to USD exchange rate
+    6. Output this to an excel file with the following header:
+    "NO."	"P/N"	 "DESCRIPTION"	"Model NO."	"Unit Price USD"	"Qty"	"Unit"	"Amount USD"
