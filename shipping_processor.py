@@ -649,10 +649,37 @@ def save_fob_prices(df, output_path):
         if 'total_gross_weight' in df_copy.columns:
             df_copy['total_gross_weight'] = pd.to_numeric(df_copy['total_gross_weight'], errors='coerce').fillna(0)
 
-        # Calculate total gross weight if necessary
-        if 'unit_gross_weight' in df_copy.columns and 'quantity' in df_copy.columns:
-            if 'total_gross_weight' not in df_copy.columns:
-                df_copy['total_gross_weight'] = df_copy['unit_gross_weight'] * df_copy['quantity']
+        # Filter out invalid rows - a row is considered valid if:
+        # 1. It has a non-empty part number
+        # 2. It has a non-zero quantity
+        # 3. It has a non-zero unit price
+        part_number = safe_get_or_create_column(df_copy, 'part_number', 
+                                              ['P/N', 'Part Number', '料号', '系统料号'])
+        quantity = safe_get_or_create_column(df_copy, 'quantity', 
+                                           ['Quantity', 'Qty', '数量'])
+        unit_price = safe_get_or_create_column(df_copy, 'unit_price', 
+                                             ['Unit Price', '单价', '不含税单价'])
+
+        valid_rows = (
+            part_number.notna() & 
+            (part_number != '') & 
+            (quantity > 0) & 
+            (unit_price > 0)
+        )
+        
+        invalid_count = (~valid_rows).sum()
+        print(f"\nFiltering out {invalid_count} invalid rows")
+        if invalid_count > 0:
+            print("Invalid rows had these issues:")
+            empty_part_numbers = (part_number.isna() | (part_number == '')).sum()
+            zero_quantities = (quantity <= 0).sum()
+            zero_prices = (unit_price <= 0).sum()
+            print(f"- Empty part numbers: {empty_part_numbers}")
+            print(f"- Zero quantities: {zero_quantities}")
+            print(f"- Zero unit prices: {zero_prices}")
+
+        df_copy = df_copy[valid_rows].copy()
+        print(f"Remaining valid rows: {len(df_copy)}")
 
         # Save to Excel with all columns
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
@@ -807,6 +834,7 @@ def generate_export_receipt(df_export, output_file):
     """
     try:
         print("\nGenerating export receipt...")
+        print(f"Initial number of rows: {len(df_export)}")
         
         # Helper function to safely get column data with fallbacks
         def safe_get_column(df, target_col, fallback_columns=None):
@@ -820,27 +848,63 @@ def generate_export_receipt(df_export, output_file):
             print(f"Warning: Column '{target_col}' and fallbacks not found. Using empty values.")
             return pd.Series(['' for _ in range(len(df))])
 
+        # Create a copy of the input DataFrame
+        df_filtered = df_export.copy()
+
+        # Print all column names for debugging
+        print("\nAvailable columns in input DataFrame:")
+        for col in df_filtered.columns:
+            print(f"- {col}")
+
+        # Filter out items with Export Customs Method as "一般贸易" (General Trade)
+        export_method = safe_get_column(df_filtered, "export_customs_method", 
+                                      ["出口报关方式", "Export Customs Method"])
+        
+        # Print unique values in export_method column for debugging
+        print("\nUnique values in export customs method column:")
+        print(export_method.value_counts().to_string())
+        
+        # Create mask for rows to keep (where export method IS "一般贸易")
+        mask = export_method == "一般贸易"
+        rows_before = len(df_filtered)
+        df_filtered = df_filtered[mask]
+        rows_after = len(df_filtered)
+        
+        print(f"\nExport Customs Method filter:")
+        print(f"- Rows before: {rows_before}")
+        print(f"- Rows after: {rows_after}")
+        print(f"- Rows filtered out: {rows_before - rows_after}")
+
+        if rows_before - rows_after > 0:
+            print("\nFirst 5 rows that were filtered out (non-一般贸易):")
+            filtered_rows = df_export[~mask].head()
+            for idx, row in filtered_rows.iterrows():
+                print(f"\nRow {idx}:")
+                print(f"- Export Method: '{row[export_method.name]}'")
+                print(f"- Material code: '{safe_get_column(pd.DataFrame([row]), 'part_number', ['Part Number', '零件号', '料号', 'P/N', 'Material code']).iloc[0]}'")
+                print(f"- Description: '{safe_get_column(pd.DataFrame([row]), 'material_name', ['物料名称', 'Material Name', 'description_en', 'DESCRIPTION']).iloc[0]}'")
+
         # Create a new DataFrame for the export receipt
         export_df = pd.DataFrame()
 
         # Handle duplicate columns by taking the first occurrence
-        df_export = df_export.loc[:, ~df_export.columns.duplicated()]
+        df_filtered = df_filtered.loc[:, ~df_filtered.columns.duplicated()]
 
         # Map existing columns to required format
-        export_df["NO."] = range(1, len(df_export) + 1)
-        export_df["P/N"] = safe_get_column(df_export, "part_number", ["Part Number", "零件号", "料号"])
-        export_df["DESCRIPTION"] = safe_get_column(df_export, "description_en", ["DESCRIPTION", "Description", "英文品名", "customs_desc_en", "material_name"])
-        export_df["Model NO."] = safe_get_column(df_export, "model", ["MODEL", "Model", "货物型号"])
+        export_df["NO."] = range(1, len(df_filtered) + 1)
+        export_df["Material code"] = safe_get_column(df_filtered, "part_number", ["Part Number", "零件号", "料号", "P/N", "Material code"])
+        export_df["DESCRIPTION"] = safe_get_column(df_filtered, "material_name", ["物料名称", "Material Name", "description_en", "DESCRIPTION", "Description", "英文品名", "customs_desc_en"])
+        export_df["Model NO."] = safe_get_column(df_filtered, "model", ["MODEL", "Model", "货物型号"])
         
         # Get quantity and ensure it's numeric
         export_df["Qty"] = pd.to_numeric(safe_get_column(
-            df_export, "quantity",
+            df_filtered, "quantity",
             fallback_columns=["Quantity", "Qty", "数量"]
         ), errors='coerce').fillna(0)
 
         # Get CIF unit price in USD and ensure it's numeric
         cif_unit_price_usd = pd.to_numeric(safe_get_column(
-            df_export, "cif_unit_price_usd",
+            df_filtered, "cif_unit_price_usd",
             fallback_columns=["cif_unit_price_usd"]  # No fallback to other price columns
         ), errors='coerce').fillna(0)
 
@@ -850,20 +914,75 @@ def generate_export_receipt(df_export, output_file):
         # Calculate Amount USD as Qty * Unit Price USD
         export_df["Amount USD"] = (export_df["Qty"] * export_df["Unit Price USD"]).round(2)
 
-        export_df["Unit"] = safe_get_column(df_export, "unit", ["Unit", "单位"])
+        export_df["Unit"] = safe_get_column(df_filtered, "unit", ["Unit", "单位"])
 
-        # Print debug information
-        print("\nExport receipt summary:")
-        print(f"Number of rows: {len(export_df)}")
-        print("\nSample of prices (first 3 rows):")
+        # Print sample of data before validation
+        print("\nSample of data before validation (first 3 rows):")
         for i in range(min(3, len(export_df))):
             print(f"\nRow {i+1}:")
-            print(f"  P/N: {export_df['P/N'].iloc[i]}")
-            print(f"  Qty: {export_df['Qty'].iloc[i]}")
-            print(f"  Unit Price USD: ${export_df['Unit Price USD'].iloc[i]:.2f}")
-            print(f"  Amount USD: ${export_df['Amount USD'].iloc[i]:.2f}")
+            print(f"Material code: '{export_df['Material code'].iloc[i]}'")
+            print(f"Qty: {export_df['Qty'].iloc[i]}")
+            print(f"Unit Price USD: {export_df['Unit Price USD'].iloc[i]}")
 
-        print(f"\nTotal Amount USD: ${export_df['Amount USD'].sum():.2f}")
+        # Filter out invalid rows - a row is considered valid if:
+        # 1. It has a non-empty Material code
+        # 2. It has a non-zero quantity
+        # 3. It has a non-zero Unit Price USD
+        valid_rows = (
+            export_df["Material code"].notna() & 
+            (export_df["Material code"] != '') &
+            (export_df["Qty"] > 0) &
+            (export_df["Unit Price USD"] > 0)
+        )
+        
+        # Print detailed validation results
+        rows_before = len(export_df)
+        invalid_material_codes = (~export_df["Material code"].notna() | (export_df["Material code"] == '')).sum()
+        invalid_qty = (export_df["Qty"] <= 0).sum()
+        invalid_price = (export_df["Unit Price USD"] <= 0).sum()
+        
+        print("\nValidation results:")
+        print(f"- Total rows before validation: {rows_before}")
+        print(f"- Rows with empty Material code: {invalid_material_codes}")
+        print(f"- Rows with zero/invalid Qty: {invalid_qty}")
+        print(f"- Rows with zero/invalid Unit Price USD: {invalid_price}")
+        
+        # Print details of invalid rows
+        print("\nFirst 5 invalid rows:")
+        invalid_df = export_df[~valid_rows]
+        for idx, row in invalid_df.head().iterrows():
+            print(f"\nInvalid Row {idx}:")
+            print(f"Material code: '{row['Material code']}'")
+            print(f"Qty: {row['Qty']}")
+            print(f"Unit Price USD: {row['Unit Price USD']}")
+            print(f"DESCRIPTION: '{row['DESCRIPTION']}'")
+            print(f"Model NO.: '{row['Model NO.']}'")
+        
+        export_df = export_df[valid_rows].copy()
+        print(f"\nFinal validation results:")
+        print(f"- Total rows after validation: {len(export_df)}")
+        print(f"- Total rows filtered out: {rows_before - len(export_df)}")
+        
+        # Reindex the NO. column after filtering
+        export_df["NO."] = range(1, len(export_df) + 1)
+
+        # Reorder columns to match required format
+        columns = [
+            "NO.",
+            "Material code",
+            "DESCRIPTION",
+            "Model NO.",
+            "Unit Price USD",
+            "Qty",
+            "Unit",
+            "Amount USD"
+        ]
+        export_df = export_df[columns]
+
+        # Print final summary
+        print("\nFinal export receipt summary:")
+        print(f"Number of rows: {len(export_df)}")
+        print(f"Total Amount USD: ${export_df['Amount USD'].sum():.2f}")
 
         # Create Excel writer
         with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
