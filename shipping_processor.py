@@ -14,6 +14,8 @@ import os
 from datetime import datetime
 import argparse
 import sys
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font
 
 
 def read_shipping_list(file_path):
@@ -551,32 +553,151 @@ def deduplicate_shipping_list(df):
         return df
 
 
-def calculate_cif_prices(df, policy, shipping_rate, exchange_rates):
+def calculate_fob_prices(df, policy):
     """
-    Calculate CIF unit prices for the shipping list according to the updated specification.
+    Calculate FOB prices for the shipping list according to the specification.
     
     The calculation follows these steps:
-    1. Calculate FOB unit price = Unit price * (1 + markup %)
-    2. Calculate FOB total price = FOB unit price * quantity
-    3. Calculate adjusted total goods cost with insurance = total FOB price * insurance co-efficiency * (1+insurance rate)
-    4. Calculate total shipping cost = net weight * shipping rate
-    5. Calculate CIF total cost = total goods cost with insurance + total shipping cost
-    6. Calculate CIF unit price in RMB = total CIF cost / quantity
-    7. Calculate CIF unit price in USD = CIF unit price in RMB / RMB_USD exchange rate
+    1. Get the markup percentage from the policy file
+    2. Calculate FOB prices:
+       2.a FOB unit price = Unit price * (1 + markup %)
+       2.b FOB total price = FOB unit price * quantity
     
     Args:
         df (pd.DataFrame): Shipping list DataFrame
-        policy (dict): Policy parameters including markup percentage and insurance rate
-        shipping_rate (float): Current shipping rate
-        exchange_rates (dict): Exchange rates between currencies
+        policy (dict): Policy parameters including markup percentage
         
     Returns:
-        pd.DataFrame: DataFrame with added CIF pricing information
+        pd.DataFrame: DataFrame with added FOB pricing information
     """
     # Make a copy to avoid modifying the original DataFrame
     df_copy = df.copy()
     
     try:
+        # Helper function to safely get or create columns
+        def safe_get_or_create_column(df, column_name, fallback_columns=None, default_value=0):
+            if column_name in df.columns:
+                return df[column_name]
+            
+            if fallback_columns:
+                for fallback_col in fallback_columns:
+                    if fallback_col in df.columns:
+                        print(f"Using '{fallback_col}' instead of '{column_name}' for FOB calculation")
+                        df[column_name] = df[fallback_col]
+                        return df[column_name]
+            
+            print(f"Column '{column_name}' not found. Creating with default value {default_value}")
+            df[column_name] = default_value
+            return df[column_name]
+        
+        # Ensure required columns exist
+        unit_price = safe_get_or_create_column(df_copy, 'unit_price', 
+                                             fallback_columns=['Unit Price', '单价', 'price', '不含税单价', '不含税单价（RMB）'],
+                                             default_value=1.0)
+        
+        quantity = safe_get_or_create_column(df_copy, 'quantity', 
+                                           fallback_columns=['Quantity', 'Qty', '数量', 'QUANTITY', 'QUANTITY （数量）'],
+                                           default_value=1.0)
+        
+        # Get policy parameters with defaults
+        markup_percentage = policy.get('markup_percentage', 0.05)  # Default 5% if not provided
+        
+        # Step 2.a: Calculate FOB unit price
+        df_copy['fob_unit_price'] = df_copy['unit_price'] * (1 + markup_percentage)
+        
+        # Step 2.b: Calculate FOB total price
+        df_copy['fob_total_price'] = df_copy['fob_unit_price'] * df_copy['quantity']
+        
+        print("FOB price calculation completed successfully")
+        return df_copy
+        
+    except Exception as e:
+        print(f"Error during FOB price calculation: {e}")
+        # If there's an error, add default FOB columns with reasonable values
+        print("Adding default FOB pricing due to calculation error")
+        df_copy['fob_unit_price'] = df_copy.get('unit_price', 10.0) * 1.05  # 5% markup as fallback
+        df_copy['fob_total_price'] = df_copy['fob_unit_price'] * df_copy.get('quantity', 1.0)
+        return df_copy
+
+
+def save_fob_prices(df, output_path):
+    """
+    Save the DataFrame with FOB prices to an Excel file.
+    Updates gross weight information if it already exists.
+    Preserves all original columns from the input DataFrame.
+    """
+    try:
+        # Make a copy to avoid modifying the original DataFrame
+        df_copy = df.copy()
+        
+        def safe_get_or_create_column(df, column_name, fallback_columns=None, default_value=0):
+            if column_name in df.columns:
+                return df[column_name]
+            if fallback_columns:
+                for col in fallback_columns:
+                    if col in df.columns:
+                        return df[col]
+            print(f"Creating new column: {column_name}")
+            df[column_name] = default_value
+            return df[column_name]
+
+        # Convert quantity and weights to numeric if they exist
+        if 'quantity' in df_copy.columns:
+            df_copy['quantity'] = pd.to_numeric(df_copy['quantity'], errors='coerce').fillna(0)
+        if 'unit_gross_weight' in df_copy.columns:
+            df_copy['unit_gross_weight'] = pd.to_numeric(df_copy['unit_gross_weight'], errors='coerce').fillna(0)
+        if 'total_gross_weight' in df_copy.columns:
+            df_copy['total_gross_weight'] = pd.to_numeric(df_copy['total_gross_weight'], errors='coerce').fillna(0)
+
+        # Calculate total gross weight if necessary
+        if 'unit_gross_weight' in df_copy.columns and 'quantity' in df_copy.columns:
+            if 'total_gross_weight' not in df_copy.columns:
+                df_copy['total_gross_weight'] = df_copy['unit_gross_weight'] * df_copy['quantity']
+
+        # Save to Excel with all columns
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            df_copy.to_excel(writer, sheet_name='FOB Prices', index=False)
+            
+            # Add metadata sheet
+            metadata = pd.DataFrame({
+                'Created Date': [datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+                'Total Items': [len(df_copy)],
+                'Total Quantity': [df_copy['quantity'].sum() if 'quantity' in df_copy.columns else 0],
+                'Total Gross Weight': [df_copy['total_gross_weight'].sum() if 'total_gross_weight' in df_copy.columns else 0]
+            })
+            metadata.to_excel(writer, sheet_name='Metadata', index=False)
+
+        print(f"Successfully saved FOB prices to {output_path}")
+        return True
+
+    except Exception as e:
+        print(f"Error saving FOB prices: {str(e)}")
+        return False
+
+
+def calculate_cif_prices(df, policy, shipping_rate, exchange_rates):
+    """
+    Calculate CIF unit prices for the shipping list according to the updated specification.
+    
+    The calculation follows these steps:
+    4. The CIF unit price is calculated based on the following:
+       4.a Convert FOB prices from CNY to USD by multiplying by exchange rate (RMB_USD)
+       4.b Calculate the adjusted total goods cost with insurance: (total FOB price in USD * insurance co-efficiency * (1+insurance rate))
+       4.c Calculate the total shipping cost in CNY first: net weight * shipping rate, then convert to USD
+       4.d Calculate the CIF total cost in USD: total goods cost with insurance + total shipping cost in USD
+       4.e Calculate the CIF unit price in USD: total CIF cost / quantity
+    """
+    # Make a copy to avoid modifying the original DataFrame
+    df_copy = df.copy()
+    
+    try:
+        print("\nStarting CIF price calculation...")
+        exchange_rate_usd = exchange_rates.get('RMB_USD', 0.13)  # Default to 0.13 if not provided
+        print(f"Exchange rate (RMB/USD): {exchange_rate_usd}")
+        print(f"Shipping rate (CNY/kg): {shipping_rate}")
+        print(f"Insurance coefficient: {policy.get('insurance_coefficient', 1.0)}")
+        print(f"Insurance rate: {policy.get('insurance_rate', 0.01)}")
+        
         # Helper function to safely get or create columns
         def safe_get_or_create_column(df, column_name, fallback_columns=None, default_value=0):
             if column_name in df.columns:
@@ -594,178 +715,190 @@ def calculate_cif_prices(df, policy, shipping_rate, exchange_rates):
             return df[column_name]
         
         # Ensure required columns exist
-        unit_price = safe_get_or_create_column(df_copy, 'unit_price', 
-                                             fallback_columns=['Unit Price', '单价', 'price', '不含税单价'],
-                                             default_value=1.0)
-        
         quantity = safe_get_or_create_column(df_copy, 'quantity', 
-                                           fallback_columns=['Quantity', 'Qty', '数量', 'QUANTITY'],
+                                           fallback_columns=['Quantity', 'Qty', '数量', 'QUANTITY', 'QUANTITY （数量）'],
                                            default_value=1.0)
         
         total_net_weight = safe_get_or_create_column(df_copy, 'total_net_weight', 
-                                                  fallback_columns=['N.W', '总净重', 'Total Net Weight'],
+                                                  fallback_columns=['N.W', '总净重', 'Total Net Weight', 'N.W  (KG) 总净重'],
                                                   default_value=0.1)
         
+        # Check if net weight is missing, if so, use gross weight * 0.9
+        if 'total_net_weight' not in df_copy.columns or df_copy['total_net_weight'].isna().all():
+            total_gross_weight = safe_get_or_create_column(df_copy, 'total_gross_weight',
+                                                      fallback_columns=['G.W', '总毛重', 'Total Gross Weight', 'G.W（KG) 总毛重'],
+                                                      default_value=0.1)
+            df_copy['total_net_weight'] = total_gross_weight * 0.9
+            print("Using gross weight * 0.9 as net weight")
+        
+        # Ensure FOB prices exist and are numeric
+        fob_total_price = pd.to_numeric(safe_get_or_create_column(df_copy, 'fob_total_price', default_value=0), errors='coerce').fillna(0)
+        fob_unit_price = pd.to_numeric(safe_get_or_create_column(df_copy, 'fob_unit_price', default_value=0), errors='coerce').fillna(0)
+        
+        # Step 4.a: Convert FOB prices from CNY to USD by multiplying by exchange rate
+        df_copy['fob_total_price_usd'] = df_copy['fob_total_price'] * exchange_rate_usd
+        df_copy['fob_unit_price_usd'] = df_copy['fob_unit_price'] * exchange_rate_usd
+        
+        print("\nSample FOB price conversion (first 3 rows):")
+        for i in range(min(3, len(df_copy))):
+            print(f"\nRow {i+1}:")
+            print(f"  FOB Unit Price (CNY): ¥{df_copy['fob_unit_price'].iloc[i]:.2f}")
+            print(f"  FOB Unit Price (USD): ${df_copy['fob_unit_price_usd'].iloc[i]:.2f}")
+            print(f"  FOB Total Price (CNY): ¥{df_copy['fob_total_price'].iloc[i]:.2f}")
+            print(f"  FOB Total Price (USD): ${df_copy['fob_total_price_usd'].iloc[i]:.2f}")
+        
         # Get policy parameters with defaults
-        markup_percentage = policy.get('markup_percentage', 0.05)  # Default 5% if not provided
         insurance_coefficient = policy.get('insurance_coefficient', 1.0)  # Default 1.0 if not provided
         insurance_rate = policy.get('insurance_rate', 0.01)  # Default 1% if not provided
         
-        # Step 4.a: Calculate FOB unit price
-        df_copy['fob_unit_price'] = df_copy['unit_price'] * (1 + markup_percentage)
+        # Step 4.b: Calculate adjusted total goods cost with insurance in USD
+        df_copy['total_goods_cost_with_insurance'] = df_copy['fob_total_price_usd'] * insurance_coefficient * (1 + insurance_rate)
         
-        # Step 4.b: Calculate FOB total price
-        df_copy['fob_total_price'] = df_copy['fob_unit_price'] * df_copy['quantity']
+        # Step 4.c: Calculate total shipping cost in CNY first, then convert to USD
+        df_copy['total_shipping_cost_cny'] = df_copy['total_net_weight'] * shipping_rate
+        df_copy['total_shipping_cost_usd'] = df_copy['total_shipping_cost_cny'] * exchange_rate_usd
         
-        # Step 5.a: Calculate adjusted total goods cost with insurance
-        df_copy['total_goods_cost_with_insurance'] = df_copy['fob_total_price'] * insurance_coefficient * (1 + insurance_rate)
+        # Step 4.d: Calculate CIF total cost in USD
+        df_copy['cif_total_cost_usd'] = df_copy['total_goods_cost_with_insurance'] + df_copy['total_shipping_cost_usd']
         
-        # Step 5.b: Calculate total shipping cost
-        df_copy['total_shipping_cost'] = df_copy['total_net_weight'] * shipping_rate
-        
-        # Step 5.c: Calculate CIF total cost
-        df_copy['cif_total_cost'] = df_copy['total_goods_cost_with_insurance'] + df_copy['total_shipping_cost']
-        
-        # Step 5.d: Calculate CIF unit price in RMB
+        # Step 4.e: Calculate CIF unit price in USD
         # Avoid division by zero by replacing 0 with NaN temporarily
         safe_quantity = df_copy['quantity'].replace(0, np.nan)
-        df_copy['cif_unit_price_rmb'] = df_copy['cif_total_cost'] / safe_quantity
-        df_copy['cif_unit_price_rmb'] = df_copy['cif_unit_price_rmb'].fillna(0)  # Replace NaN back with 0
+        df_copy['cif_unit_price_usd'] = df_copy['cif_total_cost_usd'] / safe_quantity
+        df_copy['cif_unit_price_usd'] = df_copy['cif_unit_price_usd'].fillna(0)  # Replace NaN back with 0
         
-        # Step 5.e: Convert to USD
-        exchange_rate_usd = exchange_rates.get('RMB_USD', 7.0)  # Default to 7.0 if not provided
-        if exchange_rate_usd == 0:
-            print("Warning: RMB_USD exchange rate is 0. Using default value of 7.0")
-            exchange_rate_usd = 7.0
-            
-        df_copy['cif_unit_price_usd'] = df_copy['cif_unit_price_rmb'] / exchange_rate_usd
+        print("\nSample CIF price calculation (first 3 rows):")
+        for i in range(min(3, len(df_copy))):
+            print(f"\nRow {i+1}:")
+            print(f"  Quantity: {df_copy['quantity'].iloc[i]}")
+            print(f"  Net Weight: {df_copy['total_net_weight'].iloc[i]:.2f} kg")
+            print(f"  Total Goods Cost with Insurance: ${df_copy['total_goods_cost_with_insurance'].iloc[i]:.2f}")
+            print(f"  Total Shipping Cost (CNY): ¥{df_copy['total_shipping_cost_cny'].iloc[i]:.2f}")
+            print(f"  Total Shipping Cost (USD): ${df_copy['total_shipping_cost_usd'].iloc[i]:.2f}")
+            print(f"  CIF Total Cost (USD): ${df_copy['cif_total_cost_usd'].iloc[i]:.2f}")
+            print(f"  CIF Unit Price (USD): ${df_copy['cif_unit_price_usd'].iloc[i]:.2f}")
         
-        # Add other relevant currencies if needed
-        if 'RMB_RUPEE' in exchange_rates and exchange_rates['RMB_RUPEE'] != 0:
-            df_copy['cif_unit_price_rupee'] = df_copy['cif_unit_price_rmb'] * exchange_rates['RMB_RUPEE']
+        # Calculate RMB prices for reference (divide USD prices by exchange rate)
+        df_copy['cif_unit_price_rmb'] = df_copy['cif_unit_price_usd'] / exchange_rate_usd
+        df_copy['cif_total_cost_rmb'] = df_copy['cif_total_cost_usd'] / exchange_rate_usd
         
-        print("CIF price calculation completed successfully")
+        print("\nCIF price calculation completed successfully")
         return df_copy
         
     except Exception as e:
         print(f"Error during CIF price calculation: {e}")
         # If there's an error, add default CIF columns with reasonable values
         print("Adding default CIF pricing due to calculation error")
-        df_copy['cif_unit_price_rmb'] = df_copy.get('unit_price', 10.0) * 1.1  # 10% markup as fallback
-        df_copy['cif_unit_price_usd'] = df_copy['cif_unit_price_rmb'] / 7.0  # Default exchange rate
+        df_copy['cif_unit_price_usd'] = df_copy.get('fob_unit_price', 10.0) * exchange_rates.get('RMB_USD', 0.13)  # Use exchange rate
+        df_copy['cif_unit_price_rmb'] = df_copy['cif_unit_price_usd'] / exchange_rate_usd
         return df_copy
 
 
-def generate_export_receipt(df, output_path):
+def generate_export_receipt(df_export, output_file):
     """
-    Generate export receipt Excel file.
+    Generate an export receipt Excel file with CIF prices in USD.
     
     Args:
-        df (pd.DataFrame): DataFrame with CIF pricing information
-        output_path (str): Path to save the export receipt
+        df_export (pd.DataFrame): DataFrame containing the export data with CIF prices
+        output_file (str): Path to save the export receipt Excel file
         
     Returns:
-        str: Path to the saved export receipt
+        bool: True if successful, False otherwise
     """
-    # Make a copy to avoid modifying the original DataFrame
-    df_export = df.copy()
-    
-    print("Generating export receipt...")
-    print(f"Available columns for export receipt: {df_export.columns.tolist()}")
-    
-    # Handle duplicate columns by renaming them with a suffix
-    # This prevents errors when accessing columns with the same name
-    if df_export.columns.duplicated().any():
-        print("Warning: Duplicate column names detected. Renaming duplicate columns.")
-        duplicate_cols = df_export.columns[df_export.columns.duplicated()].tolist()
-        for col in duplicate_cols:
-            # Find all occurrences of the duplicate column
-            cols = df_export.columns.tolist()
-            indices = [i for i, x in enumerate(cols) if x == col]
-            
-            # Rename all but the first occurrence
-            for i, idx in enumerate(indices[1:], 1):
-                cols[idx] = f"{col}_{i}"
-            
-            # Assign new column names to DataFrame
-            df_export.columns = cols
-            print(f"Renamed duplicate columns for '{col}'")
-    
-    # Create a new DataFrame with the required columns for export receipt
-    export_df = pd.DataFrame()
-    
-    # Helper function to safely get column data with a fallback
-    def safe_get_column(dataframe, column_name, fallback_value=None, fallback_columns=None):
-        if column_name in dataframe.columns:
-            return dataframe[column_name]
-        elif fallback_columns:
-            for fallback_col in fallback_columns:
-                if fallback_col in dataframe.columns:
-                    print(f"Using '{fallback_col}' instead of '{column_name}'")
-                    return dataframe[fallback_col]
-        print(f"Column '{column_name}' not found. Using fallback value.")
-        return fallback_value if fallback_value is not None else pd.Series(['-'] * len(dataframe))
-    
-    # Map the existing columns to the required format, using fallbacks when needed
-    export_df["NO."] = safe_get_column(
-        df_export, "serial_no", 
-        fallback_value=range(1, len(df_export) + 1),
-        fallback_columns=["Sr NO", "序列号", "Serial No", "Serial Number"]
-    )
-    
-    export_df["P/N"] = safe_get_column(
-        df_export, "part_number", 
-        fallback_columns=["P/N.", "P/N", "Part Number", "料号", "系统料号"]
-    )
-    
-    export_df["DESCRIPTION"] = safe_get_column(
-        df_export, "description_en", 
-        fallback_columns=["DESCRIPTION", "Description", "英文品名", "customs_desc_en", "material_name"]
-    )
-    
-    export_df["Model NO."] = safe_get_column(
-        df_export, "model", 
-        fallback_columns=["MODEL", "Model", "货物型号"]
-    )
-    
-    export_df["Unit Price USD"] = safe_get_column(
-        df_export, "cif_unit_price_usd", 
-        fallback_columns=["unit_price", "Unit Price"]
-    ).round(2)
-    
-    export_df["Qty"] = safe_get_column(
-        df_export, "quantity", 
-        fallback_columns=["QUANTITY", "Quantity", "数量", "Qty"]
-    )
-    
-    export_df["Unit"] = safe_get_column(
-        df_export, "unit", 
-        fallback_columns=["Unit", "单位"]
-    )
-    
-    # Calculate Amount USD (Unit Price USD * Qty)
-    export_df["Amount USD"] = (export_df["Unit Price USD"] * export_df["Qty"]).round(2)
-    
-    # Save to Excel
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        export_df.to_excel(writer, index=False, sheet_name='Export Receipt')
+    try:
+        print("\nGenerating export receipt...")
         
-        # Add formatting if needed
-        workbook = writer.book
-        worksheet = writer.sheets['Export Receipt']
+        # Helper function to safely get column data with fallbacks
+        def safe_get_column(df, target_col, fallback_columns=None):
+            if target_col in df.columns:
+                return df[target_col]
+            if fallback_columns:
+                for col in fallback_columns:
+                    if col in df.columns:
+                        print(f"Using fallback column '{col}' for '{target_col}'")
+                        return df[col]
+            print(f"Warning: Column '{target_col}' and fallbacks not found. Using empty values.")
+            return pd.Series(['' for _ in range(len(df))])
+
+        # Create a new DataFrame for the export receipt
+        export_df = pd.DataFrame()
+
+        # Handle duplicate columns by taking the first occurrence
+        df_export = df_export.loc[:, ~df_export.columns.duplicated()]
+
+        # Map existing columns to required format
+        export_df["NO."] = range(1, len(df_export) + 1)
+        export_df["P/N"] = safe_get_column(df_export, "part_number", ["Part Number", "零件号", "料号"])
+        export_df["DESCRIPTION"] = safe_get_column(df_export, "description_en", ["DESCRIPTION", "Description", "英文品名", "customs_desc_en", "material_name"])
+        export_df["Model NO."] = safe_get_column(df_export, "model", ["MODEL", "Model", "货物型号"])
         
-        # Add date and other metadata
-        metadata_sheet = workbook.create_sheet('Metadata')
-        metadata_sheet['A1'] = 'Generated Date'
-        metadata_sheet['B1'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    print(f"Export receipt saved to {output_path}")
-    return output_path
+        # Get quantity and ensure it's numeric
+        export_df["Qty"] = pd.to_numeric(safe_get_column(
+            df_export, "quantity",
+            fallback_columns=["Quantity", "Qty", "数量"]
+        ), errors='coerce').fillna(0)
+
+        # Get CIF unit price in USD and ensure it's numeric
+        cif_unit_price_usd = pd.to_numeric(safe_get_column(
+            df_export, "cif_unit_price_usd",
+            fallback_columns=["cif_unit_price_usd"]  # No fallback to other price columns
+        ), errors='coerce').fillna(0)
+
+        # Round to 2 decimal places for display
+        export_df["Unit Price USD"] = cif_unit_price_usd.round(2)
+        
+        # Calculate Amount USD as Qty * Unit Price USD
+        export_df["Amount USD"] = (export_df["Qty"] * export_df["Unit Price USD"]).round(2)
+
+        export_df["Unit"] = safe_get_column(df_export, "unit", ["Unit", "单位"])
+
+        # Print debug information
+        print("\nExport receipt summary:")
+        print(f"Number of rows: {len(export_df)}")
+        print("\nSample of prices (first 3 rows):")
+        for i in range(min(3, len(export_df))):
+            print(f"\nRow {i+1}:")
+            print(f"  P/N: {export_df['P/N'].iloc[i]}")
+            print(f"  Qty: {export_df['Qty'].iloc[i]}")
+            print(f"  Unit Price USD: ${export_df['Unit Price USD'].iloc[i]:.2f}")
+            print(f"  Amount USD: ${export_df['Amount USD'].iloc[i]:.2f}")
+
+        print(f"\nTotal Amount USD: ${export_df['Amount USD'].sum():.2f}")
+
+        # Create Excel writer
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            # Write main data
+            export_df.to_excel(writer, sheet_name='Export Receipt', index=False)
+            
+            # Create metadata sheet
+            metadata_df = pd.DataFrame()
+            metadata_sheet = writer.book.create_sheet('Metadata')
+            
+            # Add total amount to metadata
+            metadata_sheet['A1'] = 'Export Receipt Summary'
+            metadata_sheet['A2'] = 'Total Amount USD'
+            metadata_sheet['B2'] = export_df["Amount USD"].sum().round(2)
+            
+            # Format the metadata sheet
+            for cell in ['A1', 'A2', 'B2']:
+                metadata_sheet[cell].font = Font(bold=True)
+            
+            # Adjust column widths in main sheet
+            worksheet = writer.sheets['Export Receipt']
+            for idx, col in enumerate(export_df.columns):
+                worksheet.column_dimensions[get_column_letter(idx + 1)].width = 15
+
+        print(f"Export receipt generated successfully: {output_file}")
+        return True
+        
+    except Exception as e:
+        print(f"Error generating export receipt: {e}")
+        return False
 
 
 def generate_reimport_receipt(df, output_path):
     """
-    Generate re-import receipt Excel file.
+    Generate re-import receipt Excel file with CIF prices in USD.
     
     Args:
         df (pd.DataFrame): DataFrame with CIF pricing information
@@ -781,7 +914,6 @@ def generate_reimport_receipt(df, output_path):
     print(f"Available columns for re-import receipt: {df_reimport.columns.tolist()}")
     
     # Handle duplicate columns by renaming them with a suffix
-    # This prevents errors when accessing columns with the same name
     if df_reimport.columns.duplicated().any():
         print("Warning: Duplicate column names detected. Renaming duplicate columns.")
         duplicate_cols = df_reimport.columns[df_reimport.columns.duplicated()].tolist()
@@ -841,9 +973,9 @@ def generate_reimport_receipt(df, output_path):
         fallback_columns=["MODEL", "Model", "货物型号"]
     )
     
+    # Ensure we use CIF prices in USD, with no fallback to original unit price
     reimport_df["Unit Price USD"] = safe_get_column(
-        df_reimport, "cif_unit_price_usd", 
-        fallback_columns=["unit_price", "Unit Price"]
+        df_reimport, "cif_unit_price_usd"
     ).round(2)
     
     reimport_df["Qty"] = safe_get_column(
@@ -857,7 +989,7 @@ def generate_reimport_receipt(df, output_path):
     )
     
     reimport_df["Amount USD"] = (reimport_df["Unit Price USD"] * reimport_df["Qty"]).round(2)
-    
+
     reimport_df["Net Weight (kg)"] = safe_get_column(
         df_reimport, "unit_net_weight", 
         fallback_columns=["单件净重", "Unit Net Weight"]
@@ -895,126 +1027,471 @@ def generate_reimport_receipt(df, output_path):
     return output_path
 
 
+def normalize_shipping_list(df):
+    """
+    Normalize the shipping list by breaking down combined box items into individual rows.
+    Handles merged cells by distributing the original total weight evenly across all items.
+    Preserves all original columns in the process.
+    Fills missing information from the previous line when available.
+    """
+    try:
+        # Make a copy to avoid modifying the original DataFrame
+        df_copy = df.copy()
+        
+        # Reset index to avoid any duplicate index issues
+        df_copy.reset_index(drop=True, inplace=True)
+        
+        # Store all original columns
+        original_columns = df_copy.columns.tolist()
+        print("\nProcessing columns for empty values:")
+        
+        # Helper function to check if a value should be considered empty
+        def is_empty_value(val):
+            if pd.isna(val):  # Handles np.nan, None, and pd.NaT
+                return True
+            if isinstance(val, str):
+                # Check for empty strings, whitespace, 'nan', 'none', 'null', '-', etc.
+                cleaned = val.strip().lower()
+                return cleaned == '' or cleaned == 'nan' or cleaned == 'none' or cleaned == 'null' or cleaned == '-'
+            return False
+
+        # Helper function to identify if rows are part of the same group (previously merged)
+        def is_same_group(row1, row2):
+            """
+            Check if two rows were likely part of the same merged group.
+            Returns True if the rows share key identifiers that suggest they were previously merged.
+            """
+            # First check part number as it's the most important identifier
+            if 'part_number' in row1.index and 'part_number' in row2.index:
+                part1 = str(row1['part_number']).strip() if not pd.isna(row1['part_number']) else ''
+                part2 = str(row2['part_number']).strip() if not pd.isna(row2['part_number']) else ''
+                if part1 and part2 and part1 == part2:
+                    return True  # If part numbers match exactly, consider them the same group
+            
+            # If part numbers don't match or are empty, check other key identifiers
+            key_columns = [
+                'supplier', 'factory', 'model', 'customs_desc_en', 'customs_desc_cn',
+                'description_en', 'material_name', 'project_name', 'invoice_name'
+            ]
+            
+            # Count how many non-empty values match between the rows
+            matches = 0
+            total_comparisons = 0
+            
+            for col in key_columns:
+                if col in row1.index and col in row2.index:
+                    val1 = str(row1[col]).strip() if not pd.isna(row1[col]) else ''
+                    val2 = str(row2[col]).strip() if not pd.isna(row2[col]) else ''
+                    
+                    # Only count if at least one value is non-empty
+                    if val1 or val2:
+                        total_comparisons += 1
+                        if val1 == val2:
+                            matches += 1
+            
+            # Consider rows part of the same group if:
+            # 1. They have at least 2 matching non-empty values, or
+            # 2. They have at least 1 matching value and no conflicting values
+            return matches >= 2 or (matches >= 1 and matches == total_comparisons)
+
+        # First pass: Process rows that were previously merged
+        print("\nProcessing previously merged rows...")
+        prev_row = None
+        prev_idx = None
+        current_group = []
+
+        for idx in df_copy.index:
+            current_row = df_copy.loc[idx]
+            
+            # Check if this row should be part of the current group
+            if prev_row is not None and is_same_group(prev_row, current_row):
+                if not current_group:  # If this is the start of a new group
+                    current_group = [prev_idx, idx]
+                else:
+                    current_group.append(idx)
+            else:
+                # Process the previous group if it exists
+                if current_group:
+                    # Get the first row of the group as the source of truth
+                    source_row = df_copy.loc[current_group[0]]
+                    
+                    # Copy values to all other rows in the group
+                    for group_idx in current_group[1:]:
+                        for col in df_copy.columns:
+                            current_val = df_copy.at[group_idx, col]
+                            source_val = source_row[col]
+                            
+                            # Don't copy certain columns that should be unique per row
+                            if col not in ['serial_no', 'quantity', 'unit_gross_weight', 'total_gross_weight', 
+                                         'unit_net_weight', 'total_net_weight', 'carton_no', 'volume',
+                                         'total_volume']:
+                                # Copy value if:
+                                # 1. Current value is empty or a placeholder
+                                # 2. Source value is not empty
+                                # 3. Column is a text column (not numeric)
+                                try:
+                                    is_numeric = pd.to_numeric(df_copy[col], errors='coerce').notna().any()
+                                except:
+                                    is_numeric = False
+                                
+                                if not is_numeric and not pd.isna(source_val):
+                                    if (pd.isna(current_val) or 
+                                        (isinstance(current_val, str) and current_val.strip() in ['', '-', '/', '_', 'nan', 'none', 'null']) or
+                                        str(current_val).strip() == ''):
+                                        df_copy.at[group_idx, col] = source_val
+                                        print(f"Copied value '{source_val}' from row {current_group[0]} to column '{col}' at row {group_idx}")
+            
+            # Start a new potential group
+            current_group = [idx]
+        
+            prev_row = current_row
+            prev_idx = idx
+
+        # Process the last group if it exists
+        if current_group:
+            source_row = df_copy.loc[current_group[0]]
+            for group_idx in current_group[1:]:
+                for col in df_copy.columns:
+                    if col not in ['serial_no', 'quantity', 'unit_gross_weight', 'total_gross_weight', 
+                                  'unit_net_weight', 'total_net_weight', 'carton_no', 'volume',
+                                  'total_volume']:
+                        current_val = df_copy.at[group_idx, col]
+                        source_val = source_row[col]
+                        try:
+                            is_numeric = pd.to_numeric(df_copy[col], errors='coerce').notna().any()
+                        except:
+                            is_numeric = False
+                        
+                        if not is_numeric and not pd.isna(source_val):
+                            if (pd.isna(current_val) or 
+                                (isinstance(current_val, str) and current_val.strip() in ['', '-', '/', '_', 'nan', 'none', 'null']) or
+                                str(current_val).strip() == ''):
+                                df_copy.at[group_idx, col] = source_val
+                                print(f"Copied value '{source_val}' from row {current_group[0]} to column '{col}' at row {group_idx}")
+
+        # Second pass: Handle empty values in all columns
+        for col in df_copy.columns:
+            print(f"\nProcessing column: {col}")
+            
+            # Try to convert to numeric first
+            try:
+                numeric_series = pd.to_numeric(df_copy[col], errors='coerce')
+                if not numeric_series.isna().all():  # If at least some values are numeric
+                    print(f"Column '{col}' is numeric")
+                    # For numeric columns, only fill forward if the value is 0 or NaN
+                    mask = numeric_series.isna() | (numeric_series == 0)
+                    if mask.any():
+                        prev_val = None
+                        for idx in df_copy.index:
+                            if mask[idx] and prev_val is not None:
+                                df_copy.at[idx, col] = prev_val
+                                print(f"Filled numeric value at row {idx} with {prev_val}")
+                            elif not mask[idx]:
+                                prev_val = df_copy.at[idx, col]
+                    continue
+            except:
+                pass  # Not a numeric column, continue with string processing
+            
+            # For non-numeric columns
+            empty_mask = df_copy[col].apply(is_empty_value)
+            if empty_mask.any():
+                prev_val = None
+                for idx in df_copy.index:
+                    current_val = df_copy.at[idx, col]
+                    if is_empty_value(current_val):
+                        if prev_val is not None:
+                            df_copy.at[idx, col] = prev_val
+                            print(f"Filled empty value at row {idx} with '{prev_val}'")
+                    else:
+                        prev_val = current_val
+
+        # Third pass: Handle special columns that should be copied even if not empty
+        special_columns = ['supplier', 'project_name', 'factory', 'customs_desc_en', 'customs_desc_cn', 
+                         'description_en', 'material_name', 'model', 'invoice_name', 'purchasing_unit']
+        
+        for col in df_copy.columns:
+            if any(special_name in col.lower() for special_name in special_columns):
+                print(f"\nSpecial handling for column: {col}")
+                prev_val = None
+                for idx in df_copy.index:
+                    current_val = df_copy.at[idx, col]
+                    # For special columns, also copy if the current value looks like a placeholder
+                    if is_empty_value(current_val) or (isinstance(current_val, str) and current_val.strip() in ['-', '/', '_']):
+                        if prev_val is not None:
+                            df_copy.at[idx, col] = prev_val
+                            print(f"Filled value at row {idx} with '{prev_val}'")
+                    else:
+                        prev_val = current_val
+
+        # Now proceed with the weight calculations
+        def safe_get_or_create_column(df, column_name, fallback_columns=None, default_value=0):
+            if column_name in df.columns:
+                return df[column_name]
+            if fallback_columns:
+                for col in fallback_columns:
+                    if col in df.columns:
+                        return df[col]
+            df[column_name] = default_value
+            return df[column_name]
+
+        # Get required columns with fallbacks
+        part_number = safe_get_or_create_column(df_copy, 'part_number', ['P/N', 'part_num', '料号'])
+        quantity = safe_get_or_create_column(df_copy, 'quantity', ['QUANTITY', 'qty'])
+        unit_gross_weight = safe_get_or_create_column(df_copy, 'unit_gross_weight', ['Unit G.W', 'unit_gw'])
+        total_gross_weight = safe_get_or_create_column(df_copy, 'total_gross_weight', ['G.W（KG)', 'total_gw'])
+        unit_net_weight = safe_get_or_create_column(df_copy, 'unit_net_weight', ['Unit N.W', 'unit_nw'])
+        total_net_weight = safe_get_or_create_column(df_copy, 'total_net_weight', ['N.W  (KG)', 'total_nw'])
+
+        # Convert weights to numeric, replacing non-numeric values with 0
+        df_copy['unit_gross_weight'] = pd.to_numeric(unit_gross_weight, errors='coerce').fillna(0)
+        df_copy['total_gross_weight'] = pd.to_numeric(total_gross_weight, errors='coerce').fillna(0)
+        df_copy['unit_net_weight'] = pd.to_numeric(unit_net_weight, errors='coerce').fillna(0)
+        df_copy['total_net_weight'] = pd.to_numeric(total_net_weight, errors='coerce').fillna(0)
+        df_copy['quantity'] = pd.to_numeric(quantity, errors='coerce').fillna(0)
+
+        # Function to identify groups of consecutive rows with the same part number
+        def get_merged_groups(df):
+            groups = []
+            current_group = []
+            last_part_number = None
+            
+            for idx, row in df.iterrows():
+                current_part_number = row['part_number']
+                
+                # Check if this row should be part of the current group
+                if current_part_number == last_part_number and len(current_group) > 0:
+                    # If the row has a total weight and previous rows don't, it might be the merged cell
+                    if row['total_gross_weight'] > 0 and all(df.loc[i, 'total_gross_weight'] == 0 for i in current_group):
+                        current_group.append(idx)
+                    # If previous rows have a total weight and this one doesn't, it's likely part of the split
+                    elif row['total_gross_weight'] == 0 and any(df.loc[i, 'total_gross_weight'] > 0 for i in current_group):
+                        current_group.append(idx)
+                    # If weights match between rows
+                    elif row['total_gross_weight'] == df.loc[current_group[0], 'total_gross_weight']:
+                        current_group.append(idx)
+                    else:
+                        if len(current_group) > 1:  # Only save groups with multiple rows
+                            groups.append(current_group)
+                        current_group = [idx]
+                else:
+                    if len(current_group) > 1:  # Only save groups with multiple rows
+                        groups.append(current_group)
+                    current_group = [idx]
+                
+                last_part_number = current_part_number
+            
+            # Don't forget to add the last group
+            if len(current_group) > 1:
+                groups.append(current_group)
+            
+            return groups
+
+        # Process each group of merged rows
+        merged_groups = get_merged_groups(df_copy)
+        for group_indices in merged_groups:
+            group_df = df_copy.loc[group_indices]
+            
+            # Calculate total items in the group
+            total_items = group_df['quantity'].sum()
+            if total_items <= 0:
+                continue
+
+            print(f"\nProcessing merged group with indices {group_indices}:")
+            print(f"Total items in group: {total_items}")
+            
+            # Find the original total weight (should be in one of the rows)
+            group_weights = group_df['total_gross_weight'].unique()
+            group_weights = group_weights[group_weights > 0]
+            if len(group_weights) > 0:
+                original_gross_weight = max(group_weights)
+                # Calculate unit weight
+                unit_gross = original_gross_weight / total_items
+                unit_net = unit_gross * 0.9  # Assume net weight is 90% of gross weight
+                
+                print(f"Original total gross weight: {original_gross_weight}")
+                print(f"Calculated unit weights: gross={unit_gross}, net={unit_net}")
+                
+                # Update weights for each row in the group
+                for idx in group_indices:
+                    items_in_row = df_copy.at[idx, 'quantity']
+                    if items_in_row <= 0:
+                        continue
+                    
+                    print(f"Processing row {idx} with {items_in_row} items")
+                    
+                    # Update only the weight columns, preserving all other data
+                    df_copy.at[idx, 'unit_gross_weight'] = unit_gross
+                    df_copy.at[idx, 'total_gross_weight'] = unit_gross * items_in_row
+                    df_copy.at[idx, 'unit_net_weight'] = unit_net
+                    df_copy.at[idx, 'total_net_weight'] = unit_net * items_in_row
+                    
+                    print(f"Final weights for row {idx}:")
+                    print(f"Unit gross weight: {df_copy.at[idx, 'unit_gross_weight']}")
+                    print(f"Total gross weight: {df_copy.at[idx, 'total_gross_weight']}")
+
+        # Process remaining rows (not part of merged groups) using the original carton-based logic
+        processed_indices = set([idx for group in merged_groups for idx in group])
+        remaining_indices = set(df_copy.index) - processed_indices
+        
+        if remaining_indices:
+            print("\nProcessing remaining rows...")
+            for idx in remaining_indices:
+                row = df_copy.loc[idx]
+                if row['quantity'] <= 0:
+                    continue
+                
+                # If the row already has valid weights, keep them
+                if row['unit_gross_weight'] > 0 and row['total_gross_weight'] > 0:
+                    continue
+                
+                # Otherwise, calculate weights based on the row's data
+                if row['total_gross_weight'] > 0:
+                    unit_gross = row['total_gross_weight'] / row['quantity']
+                elif row['unit_gross_weight'] > 0:
+                    unit_gross = row['unit_gross_weight']
+                else:
+                    unit_gross = 0.1  # Minimum default weight
+                
+                unit_net = unit_gross * 0.9
+                
+                # Update only the weight columns, preserving all other data
+                df_copy.at[idx, 'unit_gross_weight'] = unit_gross
+                df_copy.at[idx, 'total_gross_weight'] = unit_gross * row['quantity']
+                df_copy.at[idx, 'unit_net_weight'] = unit_net
+                df_copy.at[idx, 'total_net_weight'] = unit_net * row['quantity']
+
+        # Ensure all original columns are preserved in the same order
+        df_copy = df_copy[original_columns]
+        
+        # Final pass: Check for any remaining empty values
+        empty_counts = {}
+        for col in df_copy.columns:
+            empty_count = df_copy[col].apply(is_empty_value).sum()
+            if empty_count > 0:
+                empty_counts[col] = empty_count
+        
+        if empty_counts:
+            print("\nWarning: Some columns still contain empty values:")
+            for col, count in empty_counts.items():
+                print(f"- {col}: {count} empty values")
+        
+        return df_copy
+        
+    except Exception as e:
+        print(f"Error during shipping list normalization: {str(e)}")
+        print("Returning original DataFrame")
+        return df
+
+
 def process_shipping_list(
     shipping_list_file,
     policy_file,
     shipping_rate_file,
     exchange_rate_file,
-    output_deduped_file,
+    output_fob_file,
     output_export_file,
     output_reimport_file
 ):
     """
-    Main function to process shipping list and generate required outputs.
-    
-    Args:
-        shipping_list_file (str): Path to shipping list Excel file
-        policy_file (str): Path to policy Excel file
-        shipping_rate_file (str): Path to shipping rate Excel file
-        exchange_rate_file (str): Path to exchange rate Excel file
-        output_deduped_file (str): Path to save deduplicated shipping list
-        output_export_file (str): Path to save export receipt
-        output_reimport_file (str): Path to save re-import receipt
-        
-    Returns:
-        tuple: Paths to the generated files
+    Process the shipping list according to the specification.
+    Now includes a second pass to handle any remaining empty cells.
     """
     try:
-        # Step 1: Read input files
-        print("Reading shipping list file...")
-        shipping_df = read_shipping_list(shipping_list_file)
-        
+        # First Pass
+        print("\n=== First Pass ===")
+        print("Reading input files...")
+        df = read_shipping_list(shipping_list_file)
+        if df is None or len(df) == 0:
+            print("Error: Failed to read shipping list or file is empty")
+            return False
+
         print("Reading policy file...")
         policy = read_policy_file(policy_file)
-        
+        if policy is None:
+            print("Error: Failed to read policy file")
+            return False
+
         print("Reading shipping rate file...")
         shipping_rate = read_shipping_rate_file(shipping_rate_file)
-        
+        if shipping_rate is None:
+            print("Error: Failed to read shipping rate file")
+            return False
+
         print("Reading exchange rate file...")
         exchange_rates = read_exchange_rate_file(exchange_rate_file)
-        
-        # Step 2: Deduplicate shipping list
-        print("Deduplicating shipping list...")
+        if exchange_rates is None:
+            print("Error: Failed to read exchange rate file")
+            return False
+
+        # Step 1: Normalize the shipping list
+        print("\nNormalizing shipping list...")
+        df_normalized = normalize_shipping_list(df)
+        if df_normalized is None:
+            print("Error: Failed to normalize shipping list")
+            return False
+
+        # Step 2: Calculate FOB prices
+        print("\nCalculating FOB prices...")
+        df_with_fob = calculate_fob_prices(df_normalized, policy)
+        if df_with_fob is None:
+            print("Error: Failed to calculate FOB prices")
+            return False
+
+        # Step 3: Save FOB prices
+        print("\nSaving initial FOB prices...")
+        if not save_fob_prices(df_with_fob, output_fob_file):
+            print("Error: Failed to save FOB prices")
+            return False
+
+        # Second Pass
+        print("\n=== Second Pass ===")
+        print("Reading FOB prices file for second pass...")
         try:
-            deduped_df = deduplicate_shipping_list(shipping_df)
+            df_second_pass = pd.read_excel(output_fob_file, sheet_name='FOB Prices')
+            print(f"Successfully read FOB prices file with {len(df_second_pass)} rows")
+            
+            # Normalize the data again to fill any remaining empty cells
+            print("\nProcessing remaining empty cells...")
+            df_final = normalize_shipping_list(df_second_pass)
+            
+            # Save the final version
+            print("\nSaving final FOB prices...")
+            if not save_fob_prices(df_final, output_fob_file):
+                print("Error: Failed to save final FOB prices")
+                return False
+            
+            # Use the final version for CIF calculations
+            df_with_fob = df_final
+            
         except Exception as e:
-            print(f"Error during deduplication: {e}")
-            print("Proceeding with the original data without deduplication")
-            deduped_df = shipping_df
-        
-        # Save deduplicated file
-        print(f"Saving deduplicated shipping list to {output_deduped_file}...")
-        deduped_df.to_excel(output_deduped_file, index=False)
-        
-        # Step 3: Calculate CIF prices
-        print("Calculating CIF prices...")
-        try:
-            cif_df = calculate_cif_prices(deduped_df, policy, shipping_rate, exchange_rates)
-        except Exception as e:
-            print(f"Error during CIF price calculation: {e}")
-            print("Proceeding with the original data and adding default CIF pricing")
-            cif_df = deduped_df.copy()
-            cif_df['cif_unit_price_usd'] = cif_df.get('unit_price', 1.0) * 0.14  # Rough RMB to USD conversion
-        
-        # Step 4: Generate export receipt
-        print(f"Generating export receipt to {output_export_file}...")
-        try:
-            export_path = generate_export_receipt(cif_df, output_export_file)
-        except Exception as e:
-            print(f"Error generating export receipt: {e}")
-            # Create a simple export receipt with basic data
-            simple_export_df = pd.DataFrame({
-                "NO.": range(1, len(cif_df) + 1),
-                "P/N": cif_df.get('part_number', ['Unknown'] * len(cif_df)),
-                "DESCRIPTION": cif_df.get('description_en', [''] * len(cif_df)),
-                "Model NO.": cif_df.get('model', [''] * len(cif_df)),
-                "Unit Price USD": cif_df.get('cif_unit_price_usd', [0] * len(cif_df)),
-                "Qty": cif_df.get('quantity', [1] * len(cif_df)),
-                "Unit": cif_df.get('unit', [''] * len(cif_df)),
-                "Amount USD": cif_df.get('cif_unit_price_usd', [0] * len(cif_df)) * cif_df.get('quantity', [1] * len(cif_df))
-            })
-            simple_export_df.to_excel(output_export_file, index=False)
-            export_path = output_export_file
-            print(f"Created simplified export receipt at {export_path}")
-        
-        # Step 5: Generate re-import receipt
-        print(f"Generating re-import receipt to {output_reimport_file}...")
-        try:
-            reimport_path = generate_reimport_receipt(cif_df, output_reimport_file)
-        except Exception as e:
-            print(f"Error generating re-import receipt: {e}")
-            # Create a simple re-import receipt with basic data
-            simple_reimport_df = pd.DataFrame({
-                "NO.": range(1, len(cif_df) + 1),
-                "P/N": cif_df.get('part_number', ['Unknown'] * len(cif_df)),
-                "English Description": cif_df.get('customs_desc_en', [''] * len(cif_df)),
-                "Chinese Description": cif_df.get('customs_desc_cn', [''] * len(cif_df)),
-                "Model NO.": cif_df.get('model', [''] * len(cif_df)),
-                "Unit Price USD": cif_df.get('cif_unit_price_usd', [0] * len(cif_df)),
-                "Qty": cif_df.get('quantity', [1] * len(cif_df)),
-                "Unit": cif_df.get('unit', [''] * len(cif_df)),
-                "Amount USD": cif_df.get('cif_unit_price_usd', [0] * len(cif_df)) * cif_df.get('quantity', [1] * len(cif_df)),
-                "Net Weight (kg)": cif_df.get('unit_net_weight', [0] * len(cif_df)),
-                "Total Net Weight (kg)": cif_df.get('total_net_weight', [0] * len(cif_df))
-            })
-            simple_reimport_df.to_excel(output_reimport_file, index=False)
-            reimport_path = output_reimport_file
-            print(f"Created simplified re-import receipt at {reimport_path}")
-        
-        print("Processing completed successfully!")
-        return output_deduped_file, export_path, reimport_path
-        
+            print(f"Warning: Error during second pass: {e}")
+            print("Continuing with first pass results...")
+
+        # Step 4: Calculate CIF prices
+        print("\nCalculating CIF prices...")
+        df_with_cif = calculate_cif_prices(df_with_fob, policy, shipping_rate, exchange_rates)
+        if df_with_cif is None:
+            print("Error: Failed to calculate CIF prices")
+            return False
+
+        # Step 5: Generate export receipt
+        print("\nGenerating export receipt...")
+        if not generate_export_receipt(df_with_cif, output_export_file):
+            print("Error: Failed to generate export receipt")
+            return False
+
+        # Step 6: Generate re-import receipt
+        print("\nGenerating re-import receipt...")
+        if not generate_reimport_receipt(df_with_cif, output_reimport_file):
+            print("Error: Failed to generate re-import receipt")
+            return False
+
+        print("\nProcessing completed successfully!")
+        return True
+
     except Exception as e:
-        print(f"An error occurred during processing: {e}")
-        # Create empty output files if they don't exist
-        for file_path, file_type in [(output_deduped_file, 'deduped'), 
-                                    (output_export_file, 'export'), 
-                                    (output_reimport_file, 'reimport')]:
-            if not os.path.exists(file_path):
-                pd.DataFrame(columns=['Error']).to_excel(file_path, index=False)
-                print(f"Created empty {file_type} file at {file_path}")
-        
-        return output_deduped_file, output_export_file, output_reimport_file
+        print(f"Error in process_shipping_list: {str(e)}")
+        return False
 
 
 if __name__ == "__main__":
@@ -1023,7 +1500,7 @@ if __name__ == "__main__":
     parser.add_argument('--policy-file', required=True, help='Path to policy Excel file')
     parser.add_argument('--shipping-rate-file', required=True, help='Path to shipping rate Excel file')
     parser.add_argument('--exchange-rate-file', required=True, help='Path to exchange rate Excel file')
-    parser.add_argument('--output-deduped', default='deduped_shipping_list.xlsx', help='Path to save deduplicated shipping list')
+    parser.add_argument('--output-fob', default='shipping_fob_prices.xlsx', help='Path to save shipping list with FOB prices')
     parser.add_argument('--output-export', default='export_receipt.xlsx', help='Path to save export receipt')
     parser.add_argument('--output-reimport', default='reimport_receipt.xlsx', help='Path to save re-import receipt')
     
@@ -1034,7 +1511,7 @@ if __name__ == "__main__":
         args.policy_file,
         args.shipping_rate_file,
         args.exchange_rate_file,
-        args.output_deduped,
+        args.output_fob,
         args.output_export,
         args.output_reimport
     ) 
