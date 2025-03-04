@@ -16,6 +16,7 @@ import argparse
 import sys
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font
+import openpyxl.styles
 
 
 def read_shipping_list(file_path):
@@ -1017,7 +1018,9 @@ def generate_export_receipt(df_export, output_file):
 
 def generate_reimport_receipt(df, output_path):
     """
-    Generate re-import receipt Excel file with CIF prices in USD.
+    Generate re-import receipt Excel file with dynamic tabs:
+    1. PL (Packaging List)
+    2+ Additional tabs for each unique factory value
     
     Args:
         df (pd.DataFrame): DataFrame with CIF pricing information
@@ -1026,124 +1029,169 @@ def generate_reimport_receipt(df, output_path):
     Returns:
         str: Path to the saved re-import receipt
     """
-    # Make a copy to avoid modifying the original DataFrame
-    df_reimport = df.copy()
-    
-    print("Generating re-import receipt...")
-    print(f"Available columns for re-import receipt: {df_reimport.columns.tolist()}")
-    
-    # Handle duplicate columns by renaming them with a suffix
-    if df_reimport.columns.duplicated().any():
-        print("Warning: Duplicate column names detected. Renaming duplicate columns.")
-        duplicate_cols = df_reimport.columns[df_reimport.columns.duplicated()].tolist()
-        for col in duplicate_cols:
-            # Find all occurrences of the duplicate column
-            cols = df_reimport.columns.tolist()
-            indices = [i for i, x in enumerate(cols) if x == col]
-            
-            # Rename all but the first occurrence
-            for i, idx in enumerate(indices[1:], 1):
-                cols[idx] = f"{col}_{i}"
-            
-            # Assign new column names to DataFrame
-            df_reimport.columns = cols
-            print(f"Renamed duplicate columns for '{col}'")
-    
-    # Create a new DataFrame with the required columns for re-import receipt
-    reimport_df = pd.DataFrame()
-    
-    # Helper function to safely get column data with a fallback
-    def safe_get_column(dataframe, column_name, fallback_value=None, fallback_columns=None):
-        if column_name in dataframe.columns:
-            return dataframe[column_name]
-        elif fallback_columns:
-            for fallback_col in fallback_columns:
-                if fallback_col in dataframe.columns:
-                    print(f"Using '{fallback_col}' instead of '{column_name}'")
-                    return dataframe[fallback_col]
-        print(f"Column '{column_name}' not found. Using fallback value.")
-        return fallback_value if fallback_value is not None else pd.Series(['-'] * len(dataframe))
-    
-    # Map the existing columns to a format similar to export receipt
-    # but include customs description fields which are important for re-import
-    reimport_df["NO."] = safe_get_column(
-        df_reimport, "serial_no", 
-        fallback_value=range(1, len(df_reimport) + 1),
-        fallback_columns=["Sr NO", "序列号", "Serial No", "Serial Number"]
-    )
-    
-    reimport_df["P/N"] = safe_get_column(
-        df_reimport, "part_number", 
-        fallback_columns=["P/N.", "P/N", "Part Number", "料号", "系统料号"]
-    )
-    
-    reimport_df["English Description"] = safe_get_column(
-        df_reimport, "customs_desc_en", 
-        fallback_columns=["清关英文货描", "Customs Description", "description_en", "DESCRIPTION", "英文品名"]
-    )
-    
-    reimport_df["Chinese Description"] = safe_get_column(
-        df_reimport, "customs_desc_cn", 
-        fallback_columns=["报关中文品名", "中文品名"]
-    )
-    
-    reimport_df["Model NO."] = safe_get_column(
-        df_reimport, "model", 
-        fallback_columns=["MODEL", "Model", "货物型号"]
-    )
-    
-    # Ensure we use CIF prices in USD, with no fallback to original unit price
-    reimport_df["Unit Price USD"] = safe_get_column(
-        df_reimport, "cif_unit_price_usd"
-    ).round(2)
-    
-    reimport_df["Qty"] = safe_get_column(
-        df_reimport, "quantity", 
-        fallback_columns=["QUANTITY", "Quantity", "数量", "Qty"]
-    )
-    
-    reimport_df["Unit"] = safe_get_column(
-        df_reimport, "unit", 
-        fallback_columns=["Unit", "单位"]
-    )
-    
-    reimport_df["Amount USD"] = (reimport_df["Unit Price USD"] * reimport_df["Qty"]).round(2)
+    try:
+        # Make a copy to avoid modifying the original DataFrame
+        df_reimport = df.copy()
+        
+        print("Generating re-import receipt...")
+        print(f"Available columns for re-import receipt: {df_reimport.columns.tolist()}")
+        
+        # Helper function to safely get column data with a fallback
+        def safe_get_column(dataframe, column_name, fallback_value=None, fallback_columns=None):
+            if column_name in dataframe.columns:
+                return dataframe[column_name]
+            elif fallback_columns:
+                for fallback_col in fallback_columns:
+                    if fallback_col in dataframe.columns:
+                        print(f"Using '{fallback_col}' instead of '{column_name}'")
+                        return dataframe[fallback_col]
+            print(f"Column '{column_name}' not found. Using fallback value.")
+            return fallback_value if fallback_value is not None else pd.Series(['-'] * len(dataframe))
 
-    reimport_df["Net Weight (kg)"] = safe_get_column(
-        df_reimport, "unit_net_weight", 
-        fallback_columns=["单件净重", "Unit Net Weight"]
-    )
-    
-    reimport_df["Total Net Weight (kg)"] = safe_get_column(
-        df_reimport, "total_net_weight", 
-        fallback_columns=["N.W", "总净重", "Total Net Weight"]
-    )
-    
-    reimport_df["Gross Weight (kg)"] = safe_get_column(
-        df_reimport, "unit_gross_weight", 
-        fallback_columns=["单件毛重", "Unit Gross Weight"]
-    )
-    
-    reimport_df["Total Gross Weight (kg)"] = safe_get_column(
-        df_reimport, "total_gross_weight", 
-        fallback_columns=["G.W", "总毛重", "Total Gross Weight"]
-    )
-    
-    # Save to Excel
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        reimport_df.to_excel(writer, index=False, sheet_name='Re-Import Receipt')
+        # Create Packaging List (PL) DataFrame
+        pl_df = pd.DataFrame()
         
-        # Add formatting if needed
-        workbook = writer.book
-        worksheet = writer.sheets['Re-Import Receipt']
+        # Map columns according to the specified format
+        pl_df["Sr No."] = range(1, len(df_reimport) + 1)
         
-        # Add date and other metadata
-        metadata_sheet = workbook.create_sheet('Metadata')
-        metadata_sheet['A1'] = 'Generated Date'
-        metadata_sheet['B1'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    print(f"Re-import receipt saved to {output_path}")
-    return output_path
+        pl_df["P/N."] = safe_get_column(
+            df_reimport, "part_number", 
+            fallback_columns=["P/N.", "P/N", "Part Number", "料号", "系统料号"]
+        )
+        
+        pl_df["DESCRIPTION"] = safe_get_column(
+            df_reimport, "description_en",
+            fallback_columns=["DESCRIPTION", "Description", "英文品名", "material_name", "Material Name"]
+        )
+        
+        pl_df["QUANTITY"] = safe_get_column(
+            df_reimport, "quantity",
+            fallback_columns=["Quantity", "Qty", "数量", "QUANTITY"]
+        )
+        
+        pl_df["CTNS"] = safe_get_column(
+            df_reimport, "carton_count",
+            fallback_columns=["CTN NO.", "箱号", "Carton Count", "CTNS"],
+            fallback_value=1
+        )
+        
+        pl_df["Carton MEASUREMENT"] = safe_get_column(
+            df_reimport, "carton_measurement",
+            fallback_columns=["Carton MEASUREMENT", "外箱尺寸", "Carton Size"],
+            fallback_value="0.01"
+        )
+        
+        pl_df["G.W (KG)"] = safe_get_column(
+            df_reimport, "unit_gross_weight",
+            fallback_columns=["G.W", "单件毛重", "Unit Gross Weight"]
+        )
+        
+        pl_df["N.W(KG)"] = safe_get_column(
+            df_reimport, "unit_net_weight",
+            fallback_columns=["N.W", "单件净重", "Unit Net Weight"]
+        )
+        
+        pl_df["Carton NO."] = safe_get_column(
+            df_reimport, "carton_no",
+            fallback_columns=["CTN NO.", "箱号", "Carton Number"],
+            fallback_value=lambda x: f"F{x+1:02d}"
+        )
+
+        # Get factory information
+        factory_column = safe_get_column(
+            df_reimport, "factory",
+            fallback_columns=["工厂(Daman/Silvassa)", "工厂", "Factory"]
+        )
+
+        # Get unique factory values
+        unique_factories = factory_column.dropna().unique()
+        print(f"\nFound {len(unique_factories)} unique factories: {unique_factories}")
+
+        # Create Excel writer
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            # Write PL tab
+            pl_df.to_excel(writer, sheet_name='PL', index=False)
+            
+            # Process each factory
+            for factory in unique_factories:
+                if pd.isna(factory) or str(factory).strip() == '':
+                    continue
+                    
+                print(f"\nProcessing factory: {factory}")
+                
+                # Filter data for this factory
+                factory_mask = factory_column.str.contains(str(factory), case=False, na=False)
+                factory_data = df_reimport[factory_mask].copy()
+                
+                if len(factory_data) == 0:
+                    print(f"No data found for factory: {factory}")
+                    continue
+                
+                # Create DataFrame for this factory
+                factory_df = pd.DataFrame()
+                factory_df["NO."] = range(1, len(factory_data) + 1)
+                factory_df["Material code"] = safe_get_column(
+                    factory_data, "part_number",
+                    fallback_columns=["P/N.", "P/N", "Part Number", "料号", "系统料号"]
+                )
+                factory_df["DESCRIPTION"] = safe_get_column(
+                    factory_data, "customs_desc_en",
+                    fallback_columns=["清关英文货描", "Customs Description", "description_en", "DESCRIPTION"]
+                )
+                factory_df["Unit Price USD"] = safe_get_column(
+                    factory_data, "cif_unit_price_usd"
+                ).round(2)
+                factory_df["Qty"] = safe_get_column(
+                    factory_data, "quantity",
+                    fallback_columns=["QUANTITY", "Quantity", "数量", "Qty"]
+                )
+                factory_df["Unit"] = safe_get_column(
+                    factory_data, "unit",
+                    fallback_columns=["Unit", "单位"]
+                )
+                factory_df["Amount USD"] = (factory_df["Unit Price USD"] * factory_df["Qty"]).round(2)
+                
+                # Use factory name directly as the sheet name
+                sheet_name = str(factory).strip()
+                print(f"Creating sheet: {sheet_name} with {len(factory_df)} rows")
+                
+                # Write factory data to sheet
+                factory_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                
+                # Format the sheet
+                worksheet = writer.sheets[sheet_name]
+                for column in worksheet.columns:
+                    max_length = 0
+                    column = list(column)
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = (max_length + 2)
+                    worksheet.column_dimensions[get_column_letter(column[0].column)].width = adjusted_width
+            
+            # Format PL sheet
+            worksheet = writer.sheets['PL']
+            for column in worksheet.columns:
+                max_length = 0
+                column = list(column)
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = (max_length + 2)
+                worksheet.column_dimensions[get_column_letter(column[0].column)].width = adjusted_width
+        
+        print(f"Re-import receipt saved to {output_path}")
+        return output_path
+
+    except Exception as e:
+        print(f"Error saving re-import receipt: {str(e)}")
+        return False
 
 
 def normalize_shipping_list(df):
